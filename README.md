@@ -13,11 +13,11 @@ team project for the Compilers course.
 
 ## Team
 
-| Name | Student ID | Phase responsibility |
-|------|------------|----------------------|
-| Noura Fahad Almedlej | 445001158 | Symbol table & scope (Phase 3 part 1) |
-| Reemas Mohammed Almoajel | 445000999 | (fill in) |
-| (third member) | (fill in)  | (fill in) |
+| Name | Student ID | 
+|------|------------|-
+| Noura Fahad Almedlej | 
+| Reemas Mohammed Almoajel | 
+| Rama Abdullah Alarbeed | 
 
 Course: **Compilers** — Dr. Amal Alsaif
 
