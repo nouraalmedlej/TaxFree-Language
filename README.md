@@ -14,7 +14,7 @@ team project for the Compilers course.
 ## Team
 
 | Name | Student ID | 
-|------|------------|-
+|------|------------|
 | Noura Fahad Almedlej | 
 | Reemas Mohammed Almoajel | 
 | Rama Abdullah Alarbeed | 
