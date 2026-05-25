@@ -1,552 +1,484 @@
+"""
+parser.py — Stack-based LL(1) predictive parser for the TaxFree language.
+
+This parser uses an explicit stack with push/pop (the classical LL(1)
+predictive parser algorithm from class). It builds the same parse tree
+the recursive-descent version produced, so all downstream code
+(semantic_analyzer, tac_generator) keeps working without any change.
+
+How it works (in plain words):
+  - We start with the stack containing the end marker '$' and the start
+    symbol 'program' on top.
+  - At each step we pop the top of the stack:
+      * if it is a terminal, we try to match it against the current input
+        token. On match we advance the input.
+      * if it is a non-terminal, we look up M[non-terminal, lookahead] in
+        the LL(1) parsing table; the table gives a production A -> X1 ... Xn,
+        and we push X1..Xn on the stack in reverse order so that X1 ends up
+        on top.
+  - Parse-tree nodes are kept on a parallel "tree stack". When a
+    non-terminal is expanded, we attach the new child nodes to the parent
+    node that produced them.
+
+The grammar is the LL(1) grammar from Phase 2 (after left-recursion
+elimination and left factoring). Terminals are taken from the Phase 1
+scanner. For T_DELIM and T_OP_ARITH the value matters (e.g. '(' vs '{'),
+so for those tokens we look the table up by (type, value).
+"""
+
 from __future__ import annotations
-from typing import List
+from typing import List, Dict, Tuple, Union
 from nodes import Token, Node, ParseError
 from taxfree_scanner import tokenize
 
+
+# Internal markers
+EPS = "ε"
+END = "T_EOF"
+
+# A grammar symbol on the stack is either:
+#   - a string (the non-terminal name, like "stmt_list")
+#   - a string (a plain terminal type, like "IDENTIFIER" or "T_IF")
+#   - a tuple ("T_DELIM", "(")  or  ("T_OP_ARITH", "+")
+#       to mean "the terminal of that type AND that exact value"
+Symbol = Union[str, Tuple[str, str]]
+
+
 class Parser:
-    # Terminals that count as expression starters
-    EXPR_FIRST = {
-        "INTEGER", "FLOAT", "STRING", "BOOL_LIT", "IDENTIFIER",
-        "T_ZAKAT", "T_TAX", "T_LOAN", "T_NOT",
-        ("T_DELIM", "("),
-        ("T_OP_ARITH", "+"), ("T_OP_ARITH", "-"),
+    """Stack-based LL(1) predictive parser. Produces a parse tree."""
+
+    # The set of non-terminal names. Anything not in here is a terminal.
+    NON_TERMINALS = {
+        "program", "func_list", "param_list", "param_list_p", "param",
+        "type_name", "block",
+        "stmt_list", "statement", "stmt_p", "var_init", "if_p", "return_p",
+        "arg_list", "arg_list_p",
+        "expr",
+        "or_expr", "or_expr_p",
+        "and_expr", "and_expr_p",
+        "rel_expr", "rel_expr_p",
+        "add_expr", "add_expr_p",
+        "mul_expr", "mul_expr_p",
+        "pow_expr", "pow_expr_p",
+        "unary_expr",
+        "primary", "primary_p",
+    }
+
+    # Display label for each non-terminal in the parse tree. For prime
+    # non-terminals (like add_expr_p) we keep the apostrophe form so the
+    # tree matches what the rest of the project expects.
+    LABEL = {
+        "param_list_p": "param_list'",
+        "stmt_p":       "stmt'",
+        "if_p":         "if'",
+        "return_p":     "return'",
+        "arg_list_p":   "arg_list'",
+        "or_expr_p":    "or_expr'",
+        "and_expr_p":   "and_expr'",
+        "rel_expr_p":   "rel_expr'",
+        "add_expr_p":   "add_expr'",
+        "mul_expr_p":   "mul_expr'",
+        "pow_expr_p":   "pow_expr'",
+        "primary_p":    "primary'",
     }
 
     def __init__(self, tokens: List[Token]):
-        # Filter out whitespace/comment tokens if any
+        # Drop any whitespace/comment tokens just in case (the scanner does
+        # not emit them, but we are defensive).
         self.tokens = [t for t in tokens if t.type not in ("T_COMMENT", "T_WHITESPACE")]
-        self.pos   = 0
-        self.errors: List[str] = []
 
-    # token access 
-    def peek(self) -> Token:
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        # synthetic EOF
+        # Append an explicit EOF token so the parser has a real lookahead at
+        # the end of input.
         last_line = self.tokens[-1].line if self.tokens else 1
-        return Token("T_EOF", "$", last_line)
+        self.tokens.append(Token(END, "$", last_line))
 
-    def advance(self) -> Token:
-        tok = self.peek()
-        self.pos += 1
-        return tok
+        self.pos = 0
+        self.errors: List[str] = []
+        self.table = self._build_table()
 
-    def expect(self, ttype: str, tvalue: str = None) -> Token:
-        """Consume a token, raise ParseError if it doesn't match."""
-        tok = self.peek()
-        if tok.type != ttype or (tvalue is not None and tok.value != tvalue):
-            expected = f"'{tvalue}'" if tvalue else ttype
-            found    = f"'{tok.value}'" if tok.value else tok.type
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def parse(self) -> Node:
+        """Run the LL(1) algorithm and return the root of the parse tree."""
+        # The root parse-tree node for the start symbol.
+        root = Node("program")
+
+        # Symbol stack and a parallel "node stack". Every non-terminal on
+        # the symbol stack has a matching node on the node stack — that is
+        # the node we will attach its children to when it gets expanded.
+        # Terminals push None on the node stack because they only need to
+        # add a leaf to whatever parent is currently active when matched.
+        #
+        # We push a special end marker (END, None), then the start symbol.
+        symbol_stack: List[Symbol] = [END, "program"]
+        node_stack:   List = [None, root]
+
+        # Each entry of the parent stack is the parse-tree node we should
+        # attach matched terminals to. We track parents using sentinel
+        # markers: when we expand a non-terminal A, we push the markers for
+        # each RHS symbol so they know whose parent they are.
+        # See _expand() below for details.
+
+        while symbol_stack:
+            top_symbol = symbol_stack.pop()
+            top_node = node_stack.pop()
+            lookahead = self._lookahead_key()
+
+            # End of input.
+            if top_symbol == END:
+                if self._current().type == END:
+                    return root
+                tok = self._current()
+                raise ParseError(
+                    f"Syntax error at line {tok.line}: "
+                    f"unexpected token '{tok.value}' after program end."
+                )
+
+            # Terminal on top: match against input.
+            if top_symbol not in self.NON_TERMINALS:
+                self._match(top_symbol, top_node)
+                continue
+
+            # Non-terminal on top: look up M[A, a].
+            production = self.table.get((top_symbol, lookahead))
+            if production is None and isinstance(lookahead, tuple):
+                # Fallback: try the bare type only (helps T_OP_REL which is
+                # grouped, not split by value).
+                production = self.table.get((top_symbol, lookahead[0]))
+
+            if production is None:
+                tok = self._current()
+                found = tok.value if tok.value else tok.type
+                raise ParseError(
+                    f"Syntax error at line {tok.line}: "
+                    f"unexpected '{found}' while parsing {self._display_nt(top_symbol)}."
+                )
+
+            self._expand(top_symbol, top_node, production,
+                         symbol_stack, node_stack)
+
+        # Stack emptied without seeing $ — shouldn't normally happen.
+        return root
+
+    # ------------------------------------------------------------------
+    # Stack operations
+    # ------------------------------------------------------------------
+    def _match(self, terminal: Symbol, parent_info):
+        """Match a terminal against the current input token.
+
+        parent_info is a tuple (parent_node, placeholder_node). The matched
+        terminal replaces the placeholder's contents so the leaf appears in
+        the correct position among its siblings.
+        """
+        tok = self._current()
+        if not self._token_matches(terminal, tok):
+            expected = self._display_terminal(terminal)
+            found = f"'{tok.value}'" if tok.value else tok.type
             raise ParseError(
                 f"Syntax error at line {tok.line}: expected {expected}, found {found}."
             )
-        return self.advance()
+        # Replace the placeholder's label and attach the token.
+        if parent_info is not None:
+            placeholder = parent_info
+            leaf_label = (f"{tok.type}('{tok.value}')"
+                          if isinstance(terminal, tuple)
+                          else tok.type)
+            placeholder.label = leaf_label
+            placeholder.token = tok
+        self.pos += 1
 
-    def match(self, ttype: str, tvalue: str = None) -> bool:
-        """True if the current token matches without consuming."""
-        tok = self.peek()
-        if tok.type != ttype:
-            return False
-        if tvalue is not None and tok.value != tvalue:
-            return False
-        return True
+    def _expand(self, nt: str, nt_node: Node, production: List[Symbol],
+                symbol_stack: List[Symbol], node_stack: List):
+        """
+        Apply A -> X1 X2 ... Xn. Push the RHS on the stack in reverse so
+        X1 ends up on top. Each RHS symbol — whether terminal or non-
+        terminal — gets a placeholder child node attached to nt_node in
+        left-to-right order. Non-terminals will be expanded into that
+        placeholder; terminals will be matched and overwrite the
+        placeholder's label/token.
+        """
+        # ε production: add a single "ε" child and don't push anything.
+        if not production or production == [EPS]:
+            nt_node.add(Node(EPS))
+            return
 
-    def at_expr_start(self) -> bool:
-        tok = self.peek()
-        if (tok.type, tok.value) in self.EXPR_FIRST:
-            return True
-        if tok.type in self.EXPR_FIRST:
-            return True
-        return False
+        # Create placeholders in source order and attach them now, so the
+        # final children list is in correct grammar order.
+        child_nodes = []
+        for sym in production:
+            if sym in self.NON_TERMINALS:
+                child = Node(self._display_nt(sym))
+            else:
+                # Terminal placeholder: will be filled in when matched.
+                child = Node("__pending__")
+            nt_node.add(child)
+            child_nodes.append(child)
 
-    # ── helpers that build leaf nodes ─────────
-    def leaf(self, ttype: str, tvalue: str = None) -> Node:
-        tok = self.expect(ttype, tvalue)
-        return Node(tok.type if not tvalue else f"{tok.type}('{tok.value}')", token=tok)
+        # Push RHS symbols on the stack in reverse so X1 ends up on top.
+        for sym, child in zip(reversed(production), reversed(child_nodes)):
+            symbol_stack.append(sym)
+            node_stack.append(child)
 
-    # ═══════════════════════════════════════════
-    #  ENTRY POINT
-    def parse(self) -> Node:
-        root = self.parse_program()
-        if not self.match("T_EOF"):
-            tok = self.peek()
-            raise ParseError(
-                f"Syntax error at line {tok.line}: unexpected token '{tok.value}' after program end."
-            )
-        return root
-    
-    #  PROGRAM =
-    # func_list T_START stmt_list T_FINISH
-    def parse_program(self) -> Node:
-        n = Node("program")
-        n.add(self.parse_func_list())
-        n.add(self.leaf("T_START"))
-        n.add(self.parse_stmt_list())
-        n.add(self.leaf("T_FINISH"))
-        return n
-    
-    #  func_list=
-    #  T_FUNC IDENTIFIER ( param_list ) : type_name block func_list |  ε
-    def parse_func_list(self) -> Node:
-        n = Node("func_list")
-        if self.match("T_FUNC"):
-            n.add(self.leaf("T_FUNC"))
-            n.add(self.leaf("IDENTIFIER"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_param_list())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DELIM", ":"))
-            n.add(self.parse_type_name())
-            n.add(self.parse_block())
-            n.add(self.parse_func_list())
-        else:
-            n.add(Node("ε"))
-        return n
+    # ------------------------------------------------------------------
+    # Token helpers
+    # ------------------------------------------------------------------
+    def _current(self) -> Token:
+        return self.tokens[self.pos]
 
-    #  param_list  =
-    #   param param_list'  |  ε
-    def parse_param_list(self) -> Node:
-        n = Node("param_list")
-        if self.match("IDENTIFIER"):
-            n.add(self.parse_param())
-            n.add(self.parse_param_list_p())
-        else:
-            n.add(Node("ε"))
-        return n
+    def _lookahead_key(self) -> Symbol:
+        """The terminal key used to index the parsing table."""
+        tok = self._current()
+        if tok.type in ("T_DELIM", "T_OP_ARITH"):
+            return (tok.type, tok.value)
+        return tok.type
 
-    def parse_param_list_p(self) -> Node:
-        n = Node("param_list'")
-        if self.match("T_DELIM", ","):
-            n.add(self.leaf("T_DELIM", ","))
-            n.add(self.parse_param())
-            n.add(self.parse_param_list_p())
-        else:
-            n.add(Node("ε"))
-        return n
+    def _token_matches(self, terminal: Symbol, tok: Token) -> bool:
+        if isinstance(terminal, tuple):
+            return tok.type == terminal[0] and tok.value == terminal[1]
+        return tok.type == terminal
 
-    # param  =
-    #   IDENTIFIER : type_name
-    def parse_param(self) -> Node:
-        n = Node("param")
-        n.add(self.leaf("IDENTIFIER"))
-        n.add(self.leaf("T_DELIM", ":"))
-        n.add(self.parse_type_name())
-        return n
+    def _display_terminal(self, terminal: Symbol) -> str:
+        if isinstance(terminal, tuple):
+            return f"{terminal[0]}('{terminal[1]}')"
+        return terminal
 
-    # type_name  = 
-    #  T_INT | T_FLOAT_T | T_STRING_T | T_BOOL_T | T_VOID
-    def parse_type_name(self) -> Node:
-        n = Node("type_name")
-        tok = self.peek()
-        if tok.type in ("T_INT", "T_FLOAT_T", "T_STRING_T", "T_BOOL_T", "T_VOID"):
-            n.add(self.leaf(tok.type))
-        else:
-            raise ParseError(
-                f"Syntax error at line {tok.line}: expected a type name "
-                f"(int/float/string/bool/void), found '{tok.value}'."
-            )
-        return n
+    def _display_nt(self, nt: str) -> str:
+        return self.LABEL.get(nt, nt)
 
-    # block  =
-    #   { stmt_list }
-    def parse_block(self) -> Node:
-        n = Node("block")
-        n.add(self.leaf("T_DELIM", "{"))
-        n.add(self.parse_stmt_list())
-        n.add(self.leaf("T_DELIM", "}"))
-        return n
+    # ------------------------------------------------------------------
+    # Build the LL(1) parsing table M[A, a] = production
+    # ------------------------------------------------------------------
+    def _build_table(self) -> Dict[Tuple[str, Symbol], List[Symbol]]:
+        T: Dict[Tuple[str, Symbol], List[Symbol]] = {}
 
-    #  stmt_list  =
-    #   statement stmt_list  |  ε
-    STMT_FIRST = {
-        "T_VAR", "IDENTIFIER", "T_IF", "T_WHILE",
-        "T_REPEAT", "T_PRINT", "T_READ", "T_RETURN",
-    }
+        def add(nt: str, lookaheads: List[Symbol], prod: List[Symbol]):
+            for la in lookaheads:
+                T[(nt, la)] = prod
 
-    def parse_stmt_list(self) -> Node:
-        n = Node("stmt_list")
-        if self.peek().type in self.STMT_FIRST:
-            n.add(self.parse_statement())
-            n.add(self.parse_stmt_list())
-        else:
-            n.add(Node("ε"))
-        return n
+        # FIRST-style sets used for several alternatives — defining them
+        # once keeps the rest of the table short and readable.
+        expr_start: List[Symbol] = [
+            "INTEGER", "FLOAT", "STRING", "BOOL_LIT", "IDENTIFIER",
+            "T_ZAKAT", "T_TAX", "T_LOAN", "T_NOT",
+            ("T_DELIM", "("),
+            ("T_OP_ARITH", "+"), ("T_OP_ARITH", "-"),
+        ]
+        stmt_start: List[Symbol] = [
+            "T_VAR", "IDENTIFIER", "T_IF", "T_WHILE",
+            "T_REPEAT", "T_PRINT", "T_READ", "T_RETURN",
+        ]
+        expr_follow: List[Symbol] = [
+            ("T_DELIM", ")"), ("T_DELIM", ","), ("T_DELIM", ";"),
+            ("T_DELIM", "}"),
+            "T_THEN", "T_DO", "T_UNTIL", "T_ELSE", "T_FINISH", END,
+        ]
 
-    #  statement  (8 alternatives)
-    def parse_statement(self) -> Node:
-        n   = Node("statement")
-        tok = self.peek()
+        # program -> func_list T_START stmt_list T_FINISH
+        add("program", ["T_FUNC", "T_START"],
+            ["func_list", "T_START", "stmt_list", "T_FINISH"])
 
-        if tok.type == "T_VAR":
-            # T_VAR IDENTIFIER : type_name var_init ;
-            n.add(self.leaf("T_VAR"))
-            n.add(self.leaf("IDENTIFIER"))
-            n.add(self.leaf("T_DELIM", ":"))
-            n.add(self.parse_type_name())
-            n.add(self.parse_var_init())
-            n.add(self.leaf("T_DELIM", ";"))
+        # func_list -> T_FUNC IDENTIFIER ( param_list ) : type_name block func_list | ε
+        add("func_list", ["T_FUNC"],
+            ["T_FUNC", "IDENTIFIER", ("T_DELIM", "("), "param_list",
+             ("T_DELIM", ")"), ("T_DELIM", ":"), "type_name", "block",
+             "func_list"])
+        add("func_list", ["T_START"], [EPS])
 
-        elif tok.type == "IDENTIFIER":
-            # IDENTIFIER stmt'
-            n.add(self.leaf("IDENTIFIER"))
-            n.add(self.parse_stmt_prime())
+        # param_list -> param param_list' | ε
+        add("param_list", ["IDENTIFIER"], ["param", "param_list_p"])
+        add("param_list", [("T_DELIM", ")")], [EPS])
 
-        elif tok.type == "T_IF":
-            # T_IF ( expr ) T_THEN block if'
-            n.add(self.leaf("T_IF"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_THEN"))
-            n.add(self.parse_block())
-            n.add(self.parse_if_prime())
+        # param_list' -> , param param_list' | ε
+        add("param_list_p", [("T_DELIM", ",")],
+            [("T_DELIM", ","), "param", "param_list_p"])
+        add("param_list_p", [("T_DELIM", ")")], [EPS])
 
-        elif tok.type == "T_WHILE":
-            # T_WHILE ( expr ) T_DO block
-            n.add(self.leaf("T_WHILE"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DO"))
-            n.add(self.parse_block())
+        # param -> IDENTIFIER : type_name
+        add("param", ["IDENTIFIER"],
+            ["IDENTIFIER", ("T_DELIM", ":"), "type_name"])
 
-        elif tok.type == "T_REPEAT":
-            # T_REPEAT block T_UNTIL ( expr ) ;
-            n.add(self.leaf("T_REPEAT"))
-            n.add(self.parse_block())
-            n.add(self.leaf("T_UNTIL"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DELIM", ";"))
+        # type_name -> T_INT | T_FLOAT_T | T_STRING_T | T_BOOL_T | T_VOID
+        add("type_name", ["T_INT"],      ["T_INT"])
+        add("type_name", ["T_FLOAT_T"],  ["T_FLOAT_T"])
+        add("type_name", ["T_STRING_T"], ["T_STRING_T"])
+        add("type_name", ["T_BOOL_T"],   ["T_BOOL_T"])
+        add("type_name", ["T_VOID"],     ["T_VOID"])
 
-        elif tok.type == "T_PRINT":
-            # T_PRINT ( arg_list ) ;
-            n.add(self.leaf("T_PRINT"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_arg_list())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DELIM", ";"))
+        # block -> { stmt_list }
+        add("block", [("T_DELIM", "{")],
+            [("T_DELIM", "{"), "stmt_list", ("T_DELIM", "}")])
 
-        elif tok.type == "T_READ":
-            # T_READ ( IDENTIFIER ) ;
-            n.add(self.leaf("T_READ"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.leaf("IDENTIFIER"))
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DELIM", ";"))
+        # stmt_list -> statement stmt_list | ε
+        add("stmt_list", stmt_start, ["statement", "stmt_list"])
+        add("stmt_list",
+            [("T_DELIM", "}"), "T_FINISH", "T_ELSE", "T_UNTIL", END],
+            [EPS])
 
-        elif tok.type == "T_RETURN":
-            # T_RETURN return' ;
-            n.add(self.leaf("T_RETURN"))
-            n.add(self.parse_return_prime())
-            n.add(self.leaf("T_DELIM", ";"))
+        # statement -> ...
+        add("statement", ["T_VAR"],
+            ["T_VAR", "IDENTIFIER", ("T_DELIM", ":"), "type_name",
+             "var_init", ("T_DELIM", ";")])
+        add("statement", ["IDENTIFIER"],
+            ["IDENTIFIER", "stmt_p"])
+        add("statement", ["T_IF"],
+            ["T_IF", ("T_DELIM", "("), "expr", ("T_DELIM", ")"),
+             "T_THEN", "block", "if_p"])
+        add("statement", ["T_WHILE"],
+            ["T_WHILE", ("T_DELIM", "("), "expr", ("T_DELIM", ")"),
+             "T_DO", "block"])
+        add("statement", ["T_REPEAT"],
+            ["T_REPEAT", "block", "T_UNTIL",
+             ("T_DELIM", "("), "expr", ("T_DELIM", ")"),
+             ("T_DELIM", ";")])
+        add("statement", ["T_PRINT"],
+            ["T_PRINT", ("T_DELIM", "("), "arg_list",
+             ("T_DELIM", ")"), ("T_DELIM", ";")])
+        add("statement", ["T_READ"],
+            ["T_READ", ("T_DELIM", "("), "IDENTIFIER",
+             ("T_DELIM", ")"), ("T_DELIM", ";")])
+        add("statement", ["T_RETURN"],
+            ["T_RETURN", "return_p", ("T_DELIM", ";")])
 
-        else:
-            raise ParseError(
-                f"Syntax error at line {tok.line}: unexpected token '{tok.value}' "
-                f"at start of statement."
-            )
-        return n
+        # stmt' -> = expr ; | ( arg_list ) ;
+        add("stmt_p", ["T_OP_ASSIGN"],
+            ["T_OP_ASSIGN", "expr", ("T_DELIM", ";")])
+        add("stmt_p", [("T_DELIM", "(")],
+            [("T_DELIM", "("), "arg_list", ("T_DELIM", ")"),
+             ("T_DELIM", ";")])
 
-    # stmt'  = 
-    #  T_OP_ASSIGN expr ;  |  ( arg_list ) ;
-    def parse_stmt_prime(self) -> Node:
-        n   = Node("stmt'")
-        tok = self.peek()
-        if tok.type == "T_OP_ASSIGN":
-            n.add(self.leaf("T_OP_ASSIGN"))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ";"))
-        elif tok.type == "T_DELIM" and tok.value == "(":
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_arg_list())
-            n.add(self.leaf("T_DELIM", ")"))
-            n.add(self.leaf("T_DELIM", ";"))
-        else:
-            raise ParseError(
-                f"Syntax error at line {tok.line}: expected '=' or '(' after identifier, "
-                f"found '{tok.value}'."
-            )
-        return n
+        # var_init -> = expr | ε
+        add("var_init", ["T_OP_ASSIGN"], ["T_OP_ASSIGN", "expr"])
+        add("var_init", [("T_DELIM", ";")], [EPS])
 
-    # var_init  =
-    #   T_OP_ASSIGN expr  |  ε
-    def parse_var_init(self) -> Node:
-        n = Node("var_init")
-        if self.match("T_OP_ASSIGN"):
-            n.add(self.leaf("T_OP_ASSIGN"))
-            n.add(self.parse_expr())
-        else:
-            n.add(Node("ε"))
-        return n
+        # if' -> T_ELSE block | ε
+        add("if_p", ["T_ELSE"], ["T_ELSE", "block"])
+        add("if_p",
+            stmt_start + [("T_DELIM", "}"), "T_FINISH", "T_UNTIL", END],
+            [EPS])
 
-    # if'  =  T_ELSE block  |  ε
-    def parse_if_prime(self) -> Node:
-        n = Node("if'")
-        if self.match("T_ELSE"):
-            n.add(self.leaf("T_ELSE"))
-            n.add(self.parse_block())
-        else:
-            n.add(Node("ε"))
-        return n
+        # return' -> expr | ε
+        add("return_p", expr_start, ["expr"])
+        add("return_p", [("T_DELIM", ";")], [EPS])
 
-    # return'  =
-    #   expr  |  ε
-    def parse_return_prime(self) -> Node:
-        n = Node("return'")
-        if self.at_expr_start():
-            n.add(self.parse_expr())
-        else:
-            n.add(Node("ε"))
-        return n
+        # arg_list -> expr arg_list' | ε
+        add("arg_list", expr_start, ["expr", "arg_list_p"])
+        add("arg_list", [("T_DELIM", ")")], [EPS])
 
-    # arg_list  =  expr arg_list'  |  ε
-    def parse_arg_list(self) -> Node:
-        n = Node("arg_list")
-        if self.at_expr_start():
-            n.add(self.parse_expr())
-            n.add(self.parse_arg_list_p())
-        else:
-            n.add(Node("ε"))
-        return n
+        # arg_list' -> , expr arg_list' | ε
+        add("arg_list_p", [("T_DELIM", ",")],
+            [("T_DELIM", ","), "expr", "arg_list_p"])
+        add("arg_list_p", [("T_DELIM", ")")], [EPS])
 
-    def parse_arg_list_p(self) -> Node:
-        n = Node("arg_list'")
-        if self.match("T_DELIM", ","):
-            n.add(self.leaf("T_DELIM", ","))
-            n.add(self.parse_expr())
-            n.add(self.parse_arg_list_p())
-        else:
-            n.add(Node("ε"))
-        return n
+        # ------------------------------------------------------------------
+        # Expressions
+        # ------------------------------------------------------------------
+        add("expr", expr_start, ["or_expr"])
 
-    #  EXPRESSIONS  (precedence chain)
-    
-    # expr = or_expr
-    def parse_expr(self) -> Node:
-        n = Node("expr")
-        n.add(self.parse_or_expr())
-        return n
- 
-    # or_expr = and_expr or_expr'
-    def parse_or_expr(self) -> Node:
-        n = Node("or_expr")
-        n.add(self.parse_and_expr())
-        n.add(self.parse_or_expr_p())
-        return n
- 
-    def parse_or_expr_p(self) -> Node:
-        n = Node("or_expr'")
-        if self.match("T_OR"):
-            n.add(self.leaf("T_OR"))
-            n.add(self.parse_and_expr())
-            n.add(self.parse_or_expr_p())
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # and_expr = rel_expr and_expr'
-    def parse_and_expr(self) -> Node:
-        n = Node("and_expr")
-        n.add(self.parse_rel_expr())
-        n.add(self.parse_and_expr_p())
-        return n
- 
-    def parse_and_expr_p(self) -> Node:
-        n = Node("and_expr'")
-        if self.match("T_AND"):
-            n.add(self.leaf("T_AND"))
-            n.add(self.parse_rel_expr())
-            n.add(self.parse_and_expr_p())
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # rel_expr = add_expr rel_expr'
-    def parse_rel_expr(self) -> Node:
-        n = Node("rel_expr")
-        n.add(self.parse_add_expr())
-        n.add(self.parse_rel_expr_p())
-        return n
- 
-    def parse_rel_expr_p(self) -> Node:
-        n = Node("rel_expr'")
-        if self.match("T_OP_REL"):
-            n.add(self.leaf("T_OP_REL"))
-            n.add(self.parse_add_expr())
-            n.add(self.parse_rel_expr_p())
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # add_expr = mul_expr add_expr'
-    def parse_add_expr(self) -> Node:
-        n = Node("add_expr")
-        n.add(self.parse_mul_expr())
-        n.add(self.parse_add_expr_p())
-        return n
- 
-    def parse_add_expr_p(self) -> Node:
-        n = Node("add_expr'")
-        tok = self.peek()
-        if tok.type == "T_OP_ARITH" and tok.value in ("+", "-"):
-            n.add(self.leaf("T_OP_ARITH"))
-            n.add(self.parse_mul_expr())
-            n.add(self.parse_add_expr_p())
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # mul_expr = pow_expr mul_expr'
-    def parse_mul_expr(self) -> Node:
-        n = Node("mul_expr")
-        n.add(self.parse_pow_expr())
-        n.add(self.parse_mul_expr_p())
-        return n
- 
-    def parse_mul_expr_p(self) -> Node:
-        n = Node("mul_expr'")
-        tok = self.peek()
-        if tok.type == "T_OP_ARITH" and tok.value in ("*", "/", "%"):
-            n.add(self.leaf("T_OP_ARITH"))
-            n.add(self.parse_pow_expr())
-            n.add(self.parse_mul_expr_p())
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # pow_expr = unary_expr pow_expr'
-    def parse_pow_expr(self) -> Node:
-        n = Node("pow_expr")
-        n.add(self.parse_unary_expr())
-        n.add(self.parse_pow_expr_p())
-        return n
- 
-    def parse_pow_expr_p(self) -> Node:
-        n = Node("pow_expr'")
-        tok = self.peek()
-        if tok.type == "T_OP_ARITH" and tok.value == "^":
-            n.add(self.leaf("T_OP_ARITH"))
-            n.add(self.parse_pow_expr())    # right-associative: recurse to pow_expr
-        else:
-            n.add(Node("ε"))
-        return n
- 
-    # unary_expr  =  + unary | - unary | not unary | primary
-    def parse_unary_expr(self) -> Node:
-        n   = Node("unary_expr")
-        tok = self.peek()
-        if tok.type == "T_OP_ARITH" and tok.value in ("+", "-"):
-            n.add(self.leaf("T_OP_ARITH"))
-            n.add(self.parse_unary_expr())
-        elif tok.type == "T_NOT":
-            n.add(self.leaf("T_NOT"))
-            n.add(self.parse_unary_expr())
-        else:
-            n.add(self.parse_primary())
-        return n
-    
-    #  primary
-    def parse_primary(self) -> Node:
-        n   = Node("primary")
-        tok = self.peek()
+        add("or_expr", expr_start, ["and_expr", "or_expr_p"])
+        add("or_expr_p", ["T_OR"], ["T_OR", "and_expr", "or_expr_p"])
+        add("or_expr_p", expr_follow, [EPS])
 
-        if tok.type == "INTEGER":
-            n.add(self.leaf("INTEGER"))
+        add("and_expr", expr_start, ["rel_expr", "and_expr_p"])
+        add("and_expr_p", ["T_AND"], ["T_AND", "rel_expr", "and_expr_p"])
+        add("and_expr_p", ["T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "FLOAT":
-            n.add(self.leaf("FLOAT"))
+        add("rel_expr", expr_start, ["add_expr", "rel_expr_p"])
+        add("rel_expr_p", ["T_OP_REL"],
+            ["T_OP_REL", "add_expr", "rel_expr_p"])
+        add("rel_expr_p", ["T_AND", "T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "STRING":
-            n.add(self.leaf("STRING"))
+        add("add_expr", expr_start, ["mul_expr", "add_expr_p"])
+        add("add_expr_p", [("T_OP_ARITH", "+")],
+            [("T_OP_ARITH", "+"), "mul_expr", "add_expr_p"])
+        add("add_expr_p", [("T_OP_ARITH", "-")],
+            [("T_OP_ARITH", "-"), "mul_expr", "add_expr_p"])
+        add("add_expr_p",
+            ["T_OP_REL", "T_AND", "T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "BOOL_LIT":
-            n.add(self.leaf("BOOL_LIT"))
+        add("mul_expr", expr_start, ["pow_expr", "mul_expr_p"])
+        add("mul_expr_p", [("T_OP_ARITH", "*")],
+            [("T_OP_ARITH", "*"), "pow_expr", "mul_expr_p"])
+        add("mul_expr_p", [("T_OP_ARITH", "/")],
+            [("T_OP_ARITH", "/"), "pow_expr", "mul_expr_p"])
+        add("mul_expr_p", [("T_OP_ARITH", "%")],
+            [("T_OP_ARITH", "%"), "pow_expr", "mul_expr_p"])
+        add("mul_expr_p",
+            [("T_OP_ARITH", "+"), ("T_OP_ARITH", "-"),
+             "T_OP_REL", "T_AND", "T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "T_ZAKAT":
-            n.add(self.leaf("T_ZAKAT"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
+        # pow is right-associative: pow' -> ^ pow_expr | ε  (recurses to pow_expr)
+        add("pow_expr", expr_start, ["unary_expr", "pow_expr_p"])
+        add("pow_expr_p", [("T_OP_ARITH", "^")],
+            [("T_OP_ARITH", "^"), "pow_expr"])
+        add("pow_expr_p",
+            [("T_OP_ARITH", "*"), ("T_OP_ARITH", "/"), ("T_OP_ARITH", "%"),
+             ("T_OP_ARITH", "+"), ("T_OP_ARITH", "-"),
+             "T_OP_REL", "T_AND", "T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "T_TAX":
-            n.add(self.leaf("T_TAX"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ","))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
+        # unary_expr -> + unary | - unary | not unary | primary
+        add("unary_expr", [("T_OP_ARITH", "+")],
+            [("T_OP_ARITH", "+"), "unary_expr"])
+        add("unary_expr", [("T_OP_ARITH", "-")],
+            [("T_OP_ARITH", "-"), "unary_expr"])
+        add("unary_expr", ["T_NOT"], ["T_NOT", "unary_expr"])
+        add("unary_expr",
+            ["INTEGER", "FLOAT", "STRING", "BOOL_LIT", "IDENTIFIER",
+             "T_ZAKAT", "T_TAX", "T_LOAN", ("T_DELIM", "(")],
+            ["primary"])
 
-        elif tok.type == "T_LOAN":
-            n.add(self.leaf("T_LOAN"))
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ","))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ","))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
+        # primary
+        add("primary", ["INTEGER"],  ["INTEGER"])
+        add("primary", ["FLOAT"],    ["FLOAT"])
+        add("primary", ["STRING"],   ["STRING"])
+        add("primary", ["BOOL_LIT"], ["BOOL_LIT"])
+        add("primary", ["IDENTIFIER"], ["IDENTIFIER", "primary_p"])
+        add("primary", [("T_DELIM", "(")],
+            [("T_DELIM", "("), "expr", ("T_DELIM", ")")])
+        add("primary", ["T_ZAKAT"],
+            ["T_ZAKAT", ("T_DELIM", "("), "expr", ("T_DELIM", ")")])
+        add("primary", ["T_TAX"],
+            ["T_TAX", ("T_DELIM", "("), "expr", ("T_DELIM", ","),
+             "expr", ("T_DELIM", ")")])
+        add("primary", ["T_LOAN"],
+            ["T_LOAN", ("T_DELIM", "("), "expr", ("T_DELIM", ","),
+             "expr", ("T_DELIM", ","), "expr", ("T_DELIM", ")")])
 
-        elif tok.type == "IDENTIFIER":
-            n.add(self.leaf("IDENTIFIER"))
-            n.add(self.parse_primary_prime())
+        # primary' -> ( arg_list ) | ε
+        add("primary_p", [("T_DELIM", "(")],
+            [("T_DELIM", "("), "arg_list", ("T_DELIM", ")")])
+        add("primary_p",
+            [("T_OP_ARITH", "^"), ("T_OP_ARITH", "*"), ("T_OP_ARITH", "/"),
+             ("T_OP_ARITH", "%"),
+             ("T_OP_ARITH", "+"), ("T_OP_ARITH", "-"),
+             "T_OP_REL", "T_AND", "T_OR"] + expr_follow, [EPS])
 
-        elif tok.type == "T_DELIM" and tok.value == "(":
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_expr())
-            n.add(self.leaf("T_DELIM", ")"))
+        return T
 
-        else:
-            raise ParseError(
-                f"Syntax error at line {tok.line}: unexpected token '{tok.value}' "
-                f"in expression."
-            )
-        return n
 
-    # primary'  =  ( arg_list )  |  ε
-    def parse_primary_prime(self) -> Node:
-        n = Node("primary'")
-        if self.match("T_DELIM", "("):
-            n.add(self.leaf("T_DELIM", "("))
-            n.add(self.parse_arg_list())
-            n.add(self.leaf("T_DELIM", ")"))
-        else:
-            n.add(Node("ε"))
-        return n
-    
-    
-# 
-#  run_test  — helper used by test_cases.py
-
-def run_test(source: str, test_name: str = ""):
-    """Parse source, print result + tree. Returns (success, tree_or_None)."""
-    print("=" * 60)
-    if test_name:
-        print(f"  {test_name}")
+# ----------------------------------------------------------------------
+# Convenience entry point that scanners/test files use
+# ----------------------------------------------------------------------
+def run_test(source: str, label: str = ""):
+    """Tokenize + parse a source string. Returns (ok, parse_tree_or_error)."""
+    if label:
         print("=" * 60)
-    print("SOURCE:")
-    for i, line in enumerate(source.strip().splitlines(), 1):
-        print(f"  {i:>3}  {line}")
-    print()
- 
-    tokens = tokenize(source)
-    parser = Parser(tokens)
+        print(" ", label)
+        print("=" * 60)
+        for i, line in enumerate(source.splitlines(), 1):
+            print(f"  {i:3d}  {line}")
+        print()
+
     try:
+        tokens = tokenize(source)
+        parser = Parser(tokens)
         tree = parser.parse()
-        print("✔  Parsing successful.\n")
-        print("PARSE TREE:")
+        print("✔  Parsing successful.")
+        print()
         print(tree.pretty(last=True))
         print()
         return True, tree
     except ParseError as e:
-        print(f"✘  {e}\n")
-        return False, None
- 
- 
-# 
-#  MAIN  — run all 5 test cases when executed directly
-# 
-if __name__ == "__main__":
-    import test_cases
-    test_cases.run_all()
+        print(f"✘  {e}")
+        print()
+        return False, str(e)
