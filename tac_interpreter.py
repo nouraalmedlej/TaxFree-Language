@@ -13,6 +13,11 @@ class TACInterpreter:
         self.pc = 0
         self.runtime_errors = []
         self.max_steps = 100000
+        # Call stack: entries are (return_pc, return_target_var).
+        # Used by 'call' and 'return' to implement user-defined functions.
+        self.call_stack = []
+        # The most recent return value (used after a 'return value' instruction).
+        self._last_return = 0
         self._scan_labels()
 
     def _scan_labels(self):
@@ -53,6 +58,11 @@ class TACInterpreter:
         if line.startswith("label "):
             return False
 
+        if line == "halt":
+            # End of main program: stop execution.
+            self.pc = len(self.instructions)
+            return True
+
         if line.startswith("goto "):
             target = line.split()[1]
             return self._jump_to(target)
@@ -85,6 +95,20 @@ class TACInterpreter:
             return False
 
         if line.startswith("return"):
+            # 'return expr' or 'return' alone.
+            rest = line[len("return"):].strip()
+            if rest:
+                self._last_return = self._lookup(rest)
+            else:
+                self._last_return = 0
+            # If we are inside a user-defined function call, jump back to
+            # the caller. Otherwise (return at the top level) stop.
+            if self.call_stack:
+                return_pc, return_target = self.call_stack.pop()
+                if return_target is not None:
+                    self.env[return_target] = self._last_return
+                self.pc = return_pc
+                return True
             self.pc = len(self.instructions)
             return True
 
@@ -98,8 +122,35 @@ class TACInterpreter:
         lhs = lhs.strip()
         rhs = rhs.strip()
 
+        # 'x = pop_param' pops the next parameter from the queue.
+        # Used inside function bodies to bind parameters.
+        if rhs == "pop_param":
+            if self.params_queue:
+                self.env[lhs] = self.params_queue.pop(0)
+            else:
+                self.env[lhs] = 0
+            return False
+
         if rhs.startswith("call "):
             func_name = rhs.split()[1]
+
+            # Built-ins still run inline (no jump).
+            if func_name in ("zakat", "tax", "loan"):
+                args = list(self.params_queue)
+                self.params_queue = []
+                self.env[lhs] = self._builtin_or_default(func_name, args)
+                return False
+
+            # User-defined function: jump to its label, remember where to come back.
+            target = f"__func_{func_name}"
+            if target in self.labels:
+                # Save where to resume (the next instruction after this call)
+                # and which variable should receive the returned value.
+                self.call_stack.append((self.pc + 1, lhs))
+                self.pc = self.labels[target]
+                return True
+
+            # Unknown function: fall back to old behaviour.
             args = list(self.params_queue)
             self.params_queue = []
             self.env[lhs] = self._builtin_or_default(func_name, args)
